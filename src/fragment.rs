@@ -79,11 +79,12 @@ pub struct FragmentCollector<S> {
   read_half: ReadHalf,
   write_half: WriteHalf,
   fragments: Fragments,
+  max_buffer: usize,
 }
 
 impl<'f, S> FragmentCollector<S> {
   /// Creates a new `FragmentCollector` with the provided `WebSocket`.
-  pub fn new(ws: WebSocket<S>) -> FragmentCollector<S>
+  pub fn new(ws: WebSocket<S>, max_buffer: usize) -> FragmentCollector<S>
   where
     S: AsyncRead + AsyncWrite + Unpin,
   {
@@ -93,6 +94,7 @@ impl<'f, S> FragmentCollector<S> {
       read_half,
       write_half,
       fragments: Fragments::new(),
+      max_buffer,
     }
   }
 
@@ -104,6 +106,22 @@ impl<'f, S> FragmentCollector<S> {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     loop {
+      let buffered = self
+        .fragments
+        .fragments
+        .as_ref()
+        .map(|f| match f {
+          Fragment::Text(incomplete, vec) => {
+            incomplete.map(|buf| buf.buffer_len as usize).unwrap_or(0)
+              + vec.len()
+          }
+          Fragment::Binary(vec) => vec.len(),
+        })
+        .unwrap_or(0);
+      if buffered >= self.max_buffer {
+        return Err(WebSocketError::FrameTooLarge);
+      }
+
       let (res, obligated_send) =
         self.read_half.read_frame_inner(&mut self.stream).await;
       let is_closed = self.write_half.closed;
