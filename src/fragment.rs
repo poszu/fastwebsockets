@@ -104,8 +104,15 @@ impl<'f, S> FragmentCollector<S> {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     loop {
-      let (res, obligated_send) =
-        self.read_half.read_frame_inner(&mut self.stream).await;
+      let space_left = self
+        .read_half
+        .max_message_size
+        .saturating_sub(self.fragments.len());
+
+      let (res, obligated_send) = self
+        .read_half
+        .read_frame_inner(&mut self.stream, space_left)
+        .await;
       let is_closed = self.write_half.closed;
       if let Some(obligated_send) = obligated_send {
         if !is_closed {
@@ -182,8 +189,14 @@ impl<'f, S> FragmentCollectorRead<S> {
     R: Future<Output = Result<(), E>>,
   {
     loop {
-      let (res, obligated_send) =
-        self.read_half.read_frame_inner(&mut self.stream).await;
+      let space_left = self
+        .read_half
+        .max_message_size
+        .saturating_sub(self.fragments.len());
+      let (res, obligated_send) = self
+        .read_half
+        .read_frame_inner(&mut self.stream, space_left)
+        .await;
       if let Some(frame) = obligated_send {
         let res = send_fn(frame).await;
         res.map_err(|e| WebSocketError::SendError(e.into()))?;
@@ -210,6 +223,19 @@ impl Fragments {
       fragments: None,
       opcode: OpCode::Close,
     }
+  }
+
+  fn len(&self) -> usize {
+    self
+      .fragments
+      .as_ref()
+      .map(|f| match f {
+        Fragment::Text(incomplete, vec) => {
+          incomplete.map(|buf| buf.buffer_len as usize).unwrap_or(0) + vec.len()
+        }
+        Fragment::Binary(vec) => vec.len(),
+      })
+      .unwrap_or(0)
   }
 
   pub fn accumulate<'f>(
@@ -311,5 +337,49 @@ impl Fragments {
     }
 
     Ok(None)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::io::Cursor;
+
+  use crate::{
+    FragmentCollector, Frame, Payload, Role, WebSocket, WebSocketError,
+  };
+
+  #[tokio::test]
+  async fn fragment_collector_limits_total_frame_size() {
+    let mut buff = Cursor::new(Vec::new());
+    // Fill buffer with at least 2 frames, total size > 128 bytes
+    {
+      let mut ws = WebSocket::after_handshake(&mut buff, Role::Server);
+      ws.write_frame(Frame::new(
+        false,
+        crate::OpCode::Binary,
+        None,
+        Payload::from(vec![0; 64]),
+      ))
+      .await
+      .unwrap();
+      ws.write_frame(Frame::new(
+        false,
+        crate::OpCode::Continuation,
+        None,
+        Payload::from(vec![0; 128]),
+      ))
+      .await
+      .unwrap();
+    }
+    buff.set_position(0);
+
+    // Try to read collected frame, which should fail due to the total frame size limit
+    let mut ws = WebSocket::after_handshake(&mut buff, Role::Server);
+    ws.set_max_message_size(128);
+    let mut collector = FragmentCollector::new(ws);
+    assert!(matches!(
+      collector.read_frame().await,
+      Err(WebSocketError::FrameTooLarge),
+    ));
   }
 }

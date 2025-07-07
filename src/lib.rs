@@ -296,8 +296,10 @@ impl<'f, S> WebSocketRead<S> {
     R: Future<Output = Result<(), E>>,
   {
     loop {
-      let (res, obligated_send) =
-        self.read_half.read_frame_inner(&mut self.stream).await;
+      let (res, obligated_send) = self
+        .read_half
+        .read_frame_inner(&mut self.stream, self.read_half.max_message_size)
+        .await;
       if let Some(frame) = obligated_send {
         let res = send_fn(frame).await;
         res.map_err(|e| WebSocketError::SendError(e.into()))?;
@@ -553,8 +555,10 @@ impl<'f, S> WebSocket<S> {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     loop {
-      let (res, obligated_send) =
-        self.read_half.read_frame_inner(&mut self.stream).await;
+      let (res, obligated_send) = self
+        .read_half
+        .read_frame_inner(&mut self.stream, self.read_half.max_message_size)
+        .await;
       let is_closed = self.write_half.closed;
       if let Some(frame) = obligated_send {
         if !is_closed {
@@ -597,11 +601,12 @@ impl ReadHalf {
   pub(crate) async fn read_frame_inner<'f, S>(
     &mut self,
     stream: &mut S,
+    max_size: usize,
   ) -> (Result<Option<Frame<'f>>, WebSocketError>, Option<Frame<'f>>)
   where
     S: AsyncRead + Unpin,
   {
-    let mut frame = match self.parse_frame_header(stream).await {
+    let mut frame = match self.parse_frame_header(stream, max_size).await {
       Ok(frame) => frame,
       Err(e) => return (Err(e), None),
     };
@@ -659,6 +664,7 @@ impl ReadHalf {
   async fn parse_frame_header<'a, S>(
     &mut self,
     stream: &mut S,
+    max_size: usize,
   ) -> Result<Frame<'a>, WebSocketError>
   where
     S: AsyncRead + Unpin,
@@ -732,7 +738,7 @@ impl ReadHalf {
       return Err(WebSocketError::PingFrameTooLarge);
     }
 
-    if payload_len >= self.max_message_size {
+    if payload_len >= std::cmp::min(self.max_message_size, max_size) {
       return Err(WebSocketError::FrameTooLarge);
     }
 
